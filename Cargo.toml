@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-wgpu = "25"
+wgpu = "27"
 egui = "0.33"
 egui-wgpu = "0.33"
 egui-winit = "0.33"
@@ -12,4 +12,5 @@ winit = "0.30"
 glam = "0.30"
 rand = "0.9"
 noise = "0.9"
-bytemuck = "1.21"
+bytemuck = { version = "1.21", features = ["derive"] }
+pollster = "0.4"
