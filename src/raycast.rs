@@ -8,6 +8,9 @@ pub struct RayHit {
     pub block: [i32; 3],
     /// Normal of the entered face (points back toward the ray origin cell).
     pub normal: [i32; 3],
+    /// Traversal distance to entry in ray-parameter units. Read by tests;
+    /// gameplay uses `block`/`normal` only.
+    #[allow(dead_code)]
     pub dist: f32,
 }
 
@@ -56,8 +59,8 @@ pub fn raycast(
         },
     ];
 
-    let mut axis = 0usize;
-    let mut dist = 0.0f32;
+    let mut axis;
+    let mut dist;
     loop {
         // step the axis whose boundary is nearest
         if t_max[0] <= t_max[1] && t_max[0] <= t_max[2] {

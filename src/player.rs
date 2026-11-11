@@ -104,7 +104,7 @@ impl Player {
         self.move_axis(1, self.vel.y * dt, &is_solid);
     }
 
-    fn sneak_anchor(&self, is_solid: &(impl Fn(i32, i32, i32) -> bool)) -> bool {
+    fn sneak_anchor(&self, is_solid: &impl Fn(i32, i32, i32) -> bool) -> bool {
         // is there ground directly under the feet box?
         let p = self.pos;
         let min = [ (p.x - HALF_W).floor() as i32, (p.y - 0.05).floor() as i32, (p.z - HALF_W).floor() as i32 ];
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn horizontal_motion_blocked_by_wall() {
         // floor y=0, wall column at x>=3
-        let solid = |x: i32, y: i32, z: i32| (y >= 0 && y <= 4 && x >= 3) || (y == 0);
+        let solid = |x: i32, y: i32, _z: i32| (y >= 0 && y <= 4 && x >= 3) || (y == 0);
         let mut p = Player::new(Vec3::new(2.0, 1.0, 0.5));
         let inp = Input { fwd: 1.0, strafe: 0.0, jump: false, sneak: false, sprint: false };
         // face +x: yaw such that fwd = +x  => look_dir -sy=1 => yaw=-pi/2

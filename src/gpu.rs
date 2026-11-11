@@ -145,7 +145,12 @@ impl Gpu {
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("terrain-bgl"),
             entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: uniform_ty, count: None },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: uniform_ty,
+                    count: None,
+                },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -329,10 +334,6 @@ impl Gpu {
         self.depth_view = self.depth.create_view(&wgpu::TextureViewDescriptor::default());
     }
 
-    pub fn egui_ctx(&self) -> &egui::Context {
-        self.egui_state.egui_ctx()
-    }
-
     /// Full frame: egui triangulation, terrain pass, highlight, egui pass, present.
     pub fn render_frame(
         &mut self,
@@ -433,7 +434,7 @@ impl Gpu {
 
         // ---- egui pass: load the terrain output, no depth ----
         {
-            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("egui"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -533,16 +534,130 @@ impl Frustum {
         }
     }
 
-    /// Conservative AABB test: reject only when the box lies fully outside a plane.
+    /// Conservative AABB test: reject only when the box lies fully outside a
+    /// plane. The support radius MUST use absolute normal components; the
+    /// signed form silently culls entire worlds whenever a normal component
+    /// goes negative. Regression caught 2026-11-10 via offscreen capture.
     pub fn aabb_overlap(&self, center: Vec3, half: Vec3) -> bool {
         for p in &self.planes {
-            let r = p[0] * half.x + p[1] * half.y + p[2] * half.z;
+            let r = p[0].abs() * half.x + p[1].abs() * half.y + p[2].abs() * half.z;
             let d = p[0] * center.x + p[1] * center.y + p[2] * center.z + p[3];
             if d + r < 0.0 {
                 return false;
             }
         }
         true
+    }
+}
+
+/// Headless one-shot capture: renders the scene offscreen and returns RGBA8.
+impl Gpu {
+    pub fn capture(
+        &mut self,
+        world: &World,
+        meshes: &ChunkGpuMap,
+        eye: Vec3,
+        dir: Vec3,
+        w: u32,
+        h: u32,
+    ) -> Vec<u8> {
+        let cap = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("capture"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let cap_view = cap.create_view(&wgpu::TextureViewDescriptor::default());
+        let depth = Self::make_depth(&self.device, w, h);
+        let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
+        let bpr = (w * 4).next_multiple_of(256);
+        let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: (bpr * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let vp = self.view_proj(eye, dir);
+        let fd = world.radius as f32 * CW as f32;
+        let uni = Uni {
+            view_proj: vp.to_cols_array_2d(),
+            cam_pos: [eye.x, eye.y, eye.z, 1.0],
+            fog: [fd * 0.62, fd * 0.97, 0.0, 0.0],
+            sky: [SKY.x, SKY.y, SKY.z, 0.0],
+        };
+        self.queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uni));
+
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("capture"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &cap_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: SKY.x as f64,
+                            g: SKY.y as f64,
+                            b: SKY.z as f64,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            let frustum = Frustum::from_view_proj(vp);
+            self.draw_stream(&mut pass, meshes, false, &frustum, eye);
+            self.draw_stream(&mut pass, meshes, true, &frustum, eye);
+        }
+        enc.copy_texture_to_buffer(
+            cap.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bpr),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(enc.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        self.device
+            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .expect("poll capture");
+        rx.recv().unwrap().expect("map readback");
+        let data = slice.get_mapped_range();
+        // strip row padding
+        let mut out = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            let src = &data[(y * bpr) as usize..(y * bpr + w * 4) as usize];
+            out[(y * w * 4) as usize..((y + 1) * w * 4) as usize].copy_from_slice(src);
+        }
+        drop(data);
+        readback.unmap();
+        out
     }
 }
 
@@ -557,6 +672,58 @@ pub fn highlight_vertices() -> Vec<[f32; 3]> {
         }
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vp() -> Mat4 {
+        let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2 * 0.78, 16.0 / 9.0, 0.08, 1200.0);
+        proj * Mat4::look_to_rh(Vec3::new(0.0, 0.0, 0.0), Vec3::NEG_Z, Vec3::Y)
+    }
+
+    #[test]
+    fn center_of_view_inside() {
+        let f = Frustum::from_view_proj(vp());
+        assert!(f.aabb_overlap(Vec3::new(0.0, 0.0, -20.0), Vec3::new(8.0, 8.0, 8.0)));
+    }
+
+    #[test]
+    fn behind_camera_culled() {
+        let f = Frustum::from_view_proj(vp());
+        assert!(!f.aabb_overlap(Vec3::new(0.0, 0.0, 500.0), Vec3::new(8.0, 8.0, 8.0)));
+    }
+
+    #[test]
+    fn far_beyond_far_plane_culled() {
+        let f = Frustum::from_view_proj(vp());
+        assert!(!f.aabb_overlap(Vec3::new(0.0, 0.0, -5000.0), Vec3::new(8.0, 8.0, 8.0)));
+    }
+
+    #[test]
+    fn hard_side_is_culled_near() {
+        let f = Frustum::from_view_proj(vp());
+        // strongly off-axis at close range: outside the 70 deg horizontal FOV
+        assert!(!f.aabb_overlap(Vec3::new(300.0, 0.0, -10.0), Vec3::new(4.0, 4.0, 4.0)));
+    }
+
+    /// The exact capture-camera configuration whose chunks the signed-radius
+    /// bug culled wholesale: oblique yaw/pitch, tall AABB containing the eye.
+    #[test]
+    fn oblique_camera_keeps_chunk_holding_eye() {
+        let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2 * 0.78, 1280.0 / 720.0, 0.08, 1200.0);
+        let (yaw, pitch) = (2.35f32, -0.28f32);
+        let dir = Vec3::new(-yaw.sin() * pitch.cos(), pitch.sin(), -yaw.cos() * pitch.cos());
+        let f = Frustum::from_view_proj(
+            proj * Mat4::look_to_rh(Vec3::new(8.5, 39.0, 8.5), dir, Vec3::Y),
+        );
+        let half = Vec3::new(8.0, 64.0, 8.0);
+        assert!(f.aabb_overlap(Vec3::new(8.0, 64.0, 8.0), half), "chunk under eye culled");
+        assert!(f.aabb_overlap(Vec3::new(8.0, 64.0, 24.0), half), "chunk ahead culled");
+        // straight behind the camera: must stay culled
+        assert!(!f.aabb_overlap(Vec3::new(8.5 - 120.0 * dir.x, 64.0, 8.5 - 120.0 * dir.z), half));
+    }
 }
 
 /// One chunk's GPU vertex buffer.

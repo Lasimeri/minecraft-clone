@@ -11,8 +11,8 @@ mod world;
 use glam::Vec3;
 use gpu::{ChunkGpuMap, Gpu};
 use player::{Input, Player};
-use std::collections::{HashMap, HashSet};
-use std::time::Instant;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -31,6 +31,7 @@ struct Game {
     locked: bool,
     hotbar: usize,
     last: Instant,
+    next_frame: Instant,
     fps: f32,
     acc: f32,
     seed: u32,
@@ -55,6 +56,7 @@ impl Game {
             locked: false,
             hotbar: 0,
             last: Instant::now(),
+            next_frame: Instant::now(),
             fps: 0.0,
             acc: 0.0,
             seed,
@@ -174,10 +176,6 @@ impl Game {
         }
     }
 
-    fn get_block(self_: &Self, x: i32, y: i32, z: i32) -> u8 {
-        self_.wld.as_ref().map(|w| w.get(x, y, z)).unwrap_or(0)
-    }
-
     fn targeted(&self) -> Option<raycast::RayHit> {
         let w = self.wld.as_ref()?;
         raycast::raycast(
@@ -288,7 +286,7 @@ impl ApplicationHandler for Game {
                         ));
                     }
                 } else if let Some(g) = &mut self.gpu {
-                    g.egui_state.on_window_event(&self.window.clone().unwrap(), &event);
+                    let _ = g.egui_state.on_window_event(&self.window.clone().unwrap(), &event);
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
@@ -342,7 +340,7 @@ impl ApplicationHandler for Game {
                 if !self.locked {
                     if let Some(g) = &mut self.gpu {
                         let win = self.window.clone().unwrap();
-                        g.egui_state.on_window_event(&win, &event);
+                        let _ = g.egui_state.on_window_event(&win, &event);
                     }
                 }
             }
@@ -438,7 +436,6 @@ impl Game {
             hotbar_sel: self.hotbar,
             fly: self.player.fly,
             locked: self.locked,
-            interactable: !self.locked,
         };
         match g.render_frame(w, &self.meshes, eye, dir, hit, &payload) {
             Ok(()) => {}
@@ -450,6 +447,19 @@ impl Game {
             }
             Err(e) => eprintln!("surface error: {e:?}"),
         }
+
+        // Deadline pacing: measured 2000 Hz loop under Fifo on this KDE
+        // Wayland stack (present applies no backpressure), i.e. ~1940
+        // rendered frames/s discarded by the compositor. Sleep to a 60 Hz
+        // accumulator; drift-recover when a frame overshoots.
+        const FRAME: f32 = 1.0 / 60.0;
+        self.next_frame += Duration::from_secs_f32(FRAME);
+        let now2 = Instant::now();
+        if self.next_frame < now2 {
+            self.next_frame = now2 + Duration::from_secs_f32(FRAME);
+        } else {
+            std::thread::sleep(self.next_frame.saturating_duration_since(Instant::now()));
+        }
     }
 }
 
@@ -459,6 +469,7 @@ fn main() {
     let mut radius: i32 = 8;
     let mut bench: Option<usize> = None;
     let mut bench_stats = false;
+    let mut shot_path: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -479,6 +490,14 @@ fn main() {
                 bench_stats = true;
                 i += 1;
             }
+            "--shot" => {
+                shot_path = args.get(i + 1).cloned();
+                if shot_path.is_none() {
+                    eprintln!("--shot requires a file path");
+                    std::process::exit(2);
+                }
+                i += 2;
+            }
             _ => {
                 eprintln!("usage: minecraft-clone [--seed N] [--radius R] [--bench-mesh N] [--stats]");
                 std::process::exit(2);
@@ -491,16 +510,112 @@ fn main() {
         return;
     }
 
+    if let Some(path) = shot_path {
+        shot(&path, seed);
+        return;
+    }
+
     let event_loop: EventLoop<()> = EventLoop::new().unwrap();
     let mut game = Game::new(seed, radius);
     game.stats = bench_stats;
     event_loop.run_app(&mut game).unwrap();
 }
 
+/// Offscreen one-shot renderer: hidden 1280x720 window (adapter/surface
+/// compatibility), synchronous world around spawn, one GPU render, PPM out.
+struct ShotApp {
+    path: String,
+    seed: u32,
+    done: bool,
+}
+
+impl ApplicationHandler for ShotApp {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        if self.done {
+            return;
+        }
+        self.done = true;
+        let window = std::sync::Arc::new(
+            el.create_window(
+                winit::window::Window::default_attributes()
+                    .with_visible(false)
+                    .with_inner_size(winit::dpi::PhysicalSize::new(1280, 720)),
+            )
+            .unwrap(),
+        );
+        shot_render(&self.path, self.seed, window);
+        el.exit();
+    }
+
+    fn window_event(&mut self, _el: &ActiveEventLoop, _id: winit::window::WindowId, _e: winit::event::WindowEvent) {}
+}
+
+fn shot(path: &str, seed: u32) {
+    let event_loop: EventLoop<()> = EventLoop::new().unwrap();
+    let mut app = ShotApp { path: path.to_string(), seed, done: false };
+    event_loop.run_app(&mut app).expect("shot event loop");
+}
+
+fn shot_render(path: &str, seed: u32, window: std::sync::Arc<winit::window::Window>) {
+    let mut gpu = Gpu::new(window);
+
+    // synchronous world: 9x9 chunks around origin
+    let g = world::terrain::Generator::new(seed);
+    let mut wld = world::World::new(4);
+    for cx in -4..=4 {
+        for cz in -4..=4 {
+            let data = g.generate(cx, cz);
+            wld.chunks.insert(
+                (cx, cz),
+                world::Chunk { data, meshed: true, mesh_dirty: false },
+            );
+        }
+    }
+    let mut meshes = ChunkGpuMap::new();
+    let (mut o, mut wt) = (Vec::new(), Vec::new());
+    for c in wld.chunks.keys().copied().collect::<Vec<_>>() {
+        o.clear();
+        wt.clear();
+        mesh::mesh_chunk(&wld, c.0, c.1, &wld.chunks[&c].data, &mut o, &mut wt);
+        meshes.upsert(&gpu.device, c, false, &o);
+        meshes.upsert(&gpu.device, c, true, &wt);
+    }
+
+    let h = g.height(8, 8);
+    let eye = Vec3::new(8.5, (h + 3) as f32, 8.5);
+    let (yaw, pitch) = (2.35f32, -0.28f32);
+    let dir = Vec3::new(
+        -yaw.sin() * pitch.cos(),
+        pitch.sin(),
+        -yaw.cos() * pitch.cos(),
+    );
+    let rgba = gpu.capture(&wld, &meshes, eye, dir, 1280, 720);
+
+    // PPM (P6): drop alpha, RGB rows
+    let mut ppm = format!("P6\n1280 720\n255\n").into_bytes();
+    ppm.reserve(1280 * 720 * 3);
+    // readback bytes are already R,G,B,A on this stack (verified via clear-color decode)
+    for px in rgba.chunks_exact(4) {
+        ppm.extend_from_slice(&px[..3]);
+    }
+    std::fs::write(path, &ppm).expect("write shot");
+    let (mut opaque_v, mut water_v) = (0usize, 0usize);
+    for m in &meshes.opaque {
+        opaque_v += m.count as usize;
+    }
+    for m in &meshes.water {
+        water_v += m.count as usize;
+    }
+    println!(
+        "shot: {path} seed {seed} chunks {} opaque_faces {opaque_v} water_faces {water_v} surface {:?} spawn_h {h}",
+        wld.chunks.len(),
+        wld.get(8, h, 8)
+    );
+}
+
 /// Headless mesher benchmark: padded+branchless kernel vs plain baseline.
 /// Interleaved rounds on identical terrain; reports median ms per chunk.
 fn bench_mesh(seed: u32, n: usize) {
-    use std::time::Instant;
     eprintln!("bench-mesh: seed={seed} chunks={n} rounds=5 host={} threads", std::thread::available_parallelism().map(|v| v.get()).unwrap_or(0));
     let g = world::terrain::Generator::new(seed);
 
@@ -523,23 +638,19 @@ fn bench_mesh(seed: u32, n: usize) {
     let (mut vf, mut wf, mut vp, mut wp) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
 
     for round in 0..5 {
-        let mut o = (0usize, 0usize);
-        let mut p = (0usize, 0usize);
         for &c in &coords {
             let t = Instant::now();
             mesh::mesh_chunk(&world, c.0, c.1, &world.chunks[&c].data, &mut vf, &mut wf);
             let el = t.elapsed().as_secs_f64() * 1e3;
             fast_times.push(el);
-            o = (vf.len(), wf.len());
 
             let t = Instant::now();
             mesh::mesh_chunk_plain(&world, c.0, c.1, &world.chunks[&c].data, &mut vp, &mut wp);
             let el = t.elapsed().as_secs_f64() * 1e3;
             plain_times.push(el);
-            p = (vp.len(), wp.len());
 
-            assert_eq!(o.0, p.0, "round {round}: opaque vertex mismatch {} vs {}", o.0, p.0);
-            assert_eq!(o.1, p.1, "round {round}: water vertex mismatch {} vs {}", o.1, p.1);
+            assert_eq!(vf.len(), vp.len(), "round {round}: opaque vertex mismatch");
+            assert_eq!(wf.len(), wp.len(), "round {round}: water vertex mismatch");
             vf.clear(); wf.clear(); vp.clear(); wp.clear();
         }
     }

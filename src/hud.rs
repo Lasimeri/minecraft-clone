@@ -11,7 +11,6 @@ pub struct Payload {
     pub hotbar_sel: usize,
     pub fly: bool,
     pub locked: bool,
-    pub interactable: bool,
 }
 
 pub fn paint(ctx: &egui::Context, p: &Payload) {
@@ -30,7 +29,7 @@ pub fn paint(ctx: &egui::Context, p: &Payload) {
         });
 
     // ---- hotbar ----
-    let screen = ctx.screen_rect();
+    let screen = ctx.content_rect();
     egui::Area::new(egui::Id::new("hotbar"))
         .fixed_pos(egui::pos2(screen.center().x, screen.max.y - 20.0))
         .pivot(egui::Align2::CENTER_BOTTOM)
@@ -43,9 +42,9 @@ pub fn paint(ctx: &egui::Context, p: &Payload) {
                     let (rect, _) = ui.allocate_exact_size(Vec2::splat(44.0), egui::Sense::hover());
                     let painter = ui.painter();
                     let frame = if sel {
-                        Stroke::new(3.0, Color32::from_rgb(255, 255, 255))
+                        Stroke::new(3.0_f32, Color32::from_rgb(255, 255, 255))
                     } else {
-                        Stroke::new(1.5, Color32::from_gray(140))
+                        Stroke::new(1.5_f32, Color32::from_gray(140))
                     };
                     painter.rect_filled(rect, 4.0, Color32::from_black_alpha(150));
                     painter.rect_stroke(rect, 4.0, frame, egui::StrokeKind::Inside);
@@ -66,7 +65,7 @@ pub fn paint(ctx: &egui::Context, p: &Payload) {
     // ---- crosshair ----
     let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("xhair")));
     let c = screen.center();
-    let stroke = Stroke::new(2.0, Color32::from_white_alpha(220));
+    let stroke = Stroke::new(2.0_f32, Color32::from_white_alpha(220));
     painter.line_segment([c + Vec2::new(-9.0, 0.0), c + Vec2::new(-3.0, 0.0)], stroke);
     painter.line_segment([c + Vec2::new(3.0, 0.0), c + Vec2::new(9.0, 0.0)], stroke);
     painter.line_segment([c + Vec2::new(0.0, -9.0), c + Vec2::new(0.0, -3.0)], stroke);

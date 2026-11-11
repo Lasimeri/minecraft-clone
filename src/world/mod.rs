@@ -152,26 +152,14 @@ pub struct Chunk {
     pub mesh_dirty: bool,
 }
 
-pub struct Stream {
-    pub gen_tx: mpsc::Sender<(i32, i32)>,
-    pub gen_rx: mpsc::Receiver<(i32, i32, ChunkData)>,
-    pub requested: std::collections::HashSet<(i32, i32)>,
-    pub workers: Vec<std::thread::JoinHandle<()>>,
-}
-
 pub struct World {
     pub chunks: HashMap<(i32, i32), Chunk>,
     pub radius: i32,
-    pub stream: Option<Stream>,
 }
 
 impl World {
     pub fn new(radius: i32) -> Self {
-        Self {
-            chunks: HashMap::new(),
-            radius,
-            stream: None,
-        }
+        Self { chunks: HashMap::new(), radius }
     }
 
     #[inline]

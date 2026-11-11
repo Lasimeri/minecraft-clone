@@ -475,6 +475,51 @@ mod tests {
     }
 
     #[test]
+    fn atlas_has_opaque_texels() {
+        let a = build_atlas();
+        let opaque = a.chunks_exact(4).filter(|p| p[3] > 12).count();
+        assert!(opaque > 60 * 64 / 2, "opaque texels: {opaque}");
+    }
+
+    /// Winding law for this stack (glam look_to_rh + perspective_rh, wgpu
+    /// FrontFace::Ccw evaluated in y-up clip space, Vulkan y-down framebuffer
+    /// flip absorbed by naga): a camera-facing face must have POSITIVE signed
+    /// shoelace area in NDC. Verified empirically 2026-11-10: the opposite
+    /// table was fully culled by cull_mode::Back with zero validation errors.
+    #[test]
+    fn faces_wind_ccw_for_wgpu() {
+        use glam::{Mat4, Vec3};
+        let eye = Vec3::new(8.5, 39.0, 8.5);
+        let (yaw, pitch) = (2.35f32, -0.28f32);
+        let dir = Vec3::new(-yaw.sin() * pitch.cos(), pitch.sin(), -yaw.cos() * pitch.cos());
+        let vp = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2 * 0.78, 16.0 / 9.0, 0.08, 1200.0)
+            * Mat4::look_to_rh(eye, dir, Vec3::Y);
+        let b = [1.0f32, 35.0, 16.0];
+        for f in FACES.iter() {
+            let p: Vec<Vec3> = f
+                .c
+                .iter()
+                .map(|o| {
+                    vp.project_point3(Vec3::new(
+                        b[0] + o[0] as f32,
+                        b[1] + o[1] as f32,
+                        b[2] + o[2] as f32,
+                    ))
+                })
+                .collect();
+            let area = (p[1].x - p[0].x) * (p[2].y - p[0].y) - (p[1].y - p[0].y) * (p[2].x - p[0].x);
+            let center = Vec3::new(b[0] + 0.5, b[1] + 0.5, b[2] + 0.5);
+            let to_cam = eye - center;
+            let facing = f.n[0] as f32 * to_cam.x + f.n[1] as f32 * to_cam.y + f.n[2] as f32 * to_cam.z;
+            assert!(
+                area.signum() == facing.signum() && area != 0.0,
+                "face winding wrong: n {:?} area {area} facing {facing}",
+                f.n
+            );
+        }
+    }
+
+    #[test]
     fn optimized_and_plain_agree_on_face_count() {
         let mut d = ChunkData::new();
         for x in 2..10 {
