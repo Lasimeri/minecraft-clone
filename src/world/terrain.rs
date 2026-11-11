@@ -154,11 +154,6 @@ impl Generator {
             }
         }
 
-        for lx in 0..CW {
-            for lz in 0..CW {
-                d.recalc_column(lx, lz);
-            }
-        }
         d
     }
 
@@ -270,7 +265,6 @@ mod tests {
         let a = g.generate(0, 0);
         let b = g.generate(0, 0);
         assert_eq!(&a.blocks[..], &b.blocks[..]); // pure
-        assert_eq!(&a.heights[..], &b.heights[..]);
         // bedrock floor everywhere
         for lx in 0..CW {
             for lz in 0..CW {
@@ -281,7 +275,9 @@ mod tests {
         let mut solid_cols = 0;
         for lx in 0..CW {
             for lz in 0..CW {
-                if a.column_height(lx, lz) > WATER_Y as usize {
+                let col = &a.blocks[(lx * CW + lz) * CH..(lx * CW + lz) * CH + CH];
+                let top = col.iter().rposition(|b| *b != 0).map_or(0, |y| y + 1);
+                if top > WATER_Y as usize {
                     solid_cols += 1;
                 }
             }

@@ -112,37 +112,21 @@ pub fn idx(lx: usize, lz: usize, ly: usize) -> usize {
 
 pub struct ChunkData {
     pub blocks: Box<[u8; CHUNK_BLOCKS]>,
-    /// Per-column y of the highest non-air block (255 sentinel unused; height <= CH).
-    pub heights: Box<[u8; CW * CW]>,
+    /// Sky light 0..15 per voxel, same `idx` layout as blocks. Filled by
+    /// `World::relight_region` (vertical sky seed + BFS decay-1 flood).
+    pub light: Box<[u8; CHUNK_BLOCKS]>,
 }
 
 impl ChunkData {
     pub fn new() -> Self {
         Self {
             blocks: vec![0; CHUNK_BLOCKS].into_boxed_slice().try_into().unwrap(),
-            heights: vec![0; CW * CW].into_boxed_slice().try_into().unwrap(),
+            light: vec![0; CHUNK_BLOCKS].into_boxed_slice().try_into().unwrap(),
         }
     }
     #[inline]
     pub fn get(&self, lx: usize, lz: usize, ly: usize) -> u8 {
         self.blocks[idx(lx, lz, ly)]
-    }
-    #[inline]
-    pub fn column_height(&self, lx: usize, lz: usize) -> usize {
-        self.heights[lx * CW + lz] as usize
-    }
-    pub fn recalc_column(&mut self, lx: usize, lz: usize) {
-        let base = lx * CW + lz;
-        let col = &self.blocks[base * CH..base * CH + CH];
-        // highest non-air + 1; scan from the top, early exit
-        let mut top = 0usize;
-        for y in (0..CH).rev() {
-            if col[y] != 0 {
-                top = y + 1;
-                break;
-            }
-        }
-        self.heights[base] = top as u8;
     }
 }
 
@@ -155,11 +139,25 @@ pub struct Chunk {
 pub struct World {
     pub chunks: HashMap<(i32, i32), Chunk>,
     pub radius: i32,
+    /// Chunks awaiting region relight (loads + edits), deduped.
+    pub relight_pending: std::collections::VecDeque<(i32, i32)>,
+    pub relight_set: std::collections::HashSet<(i32, i32)>,
 }
 
 impl World {
     pub fn new(radius: i32) -> Self {
-        Self { chunks: HashMap::new(), radius }
+        Self {
+            chunks: HashMap::new(),
+            radius,
+            relight_pending: std::collections::VecDeque::new(),
+            relight_set: std::collections::HashSet::new(),
+        }
+    }
+
+    pub fn queue_relight(&mut self, cx: i32, cz: i32) {
+        if self.relight_set.insert((cx, cz)) {
+            self.relight_pending.push_back((cx, cz));
+        }
     }
 
     #[inline]
@@ -181,20 +179,180 @@ impl World {
         }
     }
 
-    /// Block + its column height (for skylight). Falls back gracefully.
+    /// Block + sky light in one hashmap probe (pad construction hot path).
     #[inline]
-    pub fn sky_of_neighbor(&self, x: i32, y: i32, z: i32) -> f32 {
+    pub fn get_light(&self, x: i32, y: i32, z: i32) -> (u8, u8) {
+        if y < 0 || y >= CH as i32 {
+            return (0, 15);
+        }
         let (cx, cz) = chunk_of(x, z);
-        let h = match self.chunks.get(&(cx, cz)) {
+        match self.chunks.get(&(cx, cz)) {
             Some(c) => {
                 let (lx, lz) = local_of(x, z);
-                c.data.column_height(lx, lz)
+                let i = idx(lx, lz, y as usize);
+                (c.data.blocks[i], c.data.light[i])
             }
-            None => 0,
+            None => {
+                let b = if y < WATER_Y { 0 } else { block::STONE };
+                (b, 15)
+            }
+        }
+    }
+
+    /// Sky light 0..15 at a world cell. Unloaded columns read as open sky
+    /// (matches the stone fallback in `get`: the surface is lit, and mesh
+    /// seams redraw once the chunk arrives and relights).
+    #[inline]
+    pub fn light_of(&self, x: i32, y: i32, z: i32) -> u8 {
+        if y < 0 || y >= CH as i32 {
+            return 15;
+        }
+        let (cx, cz) = chunk_of(x, z);
+        match self.chunks.get(&(cx, cz)) {
+            Some(c) => {
+                let (lx, lz) = local_of(x, z);
+                c.data.light[idx(lx, lz, y as usize)]
+            }
+            None => 15,
+        }
+    }
+
+    /// Rebuild sky light over the 3x3 chunk region around (ccx, ccz):
+    /// vertical sky seed per column (15 down to the first opaque block),
+    /// boundary seeds from loaded neighbors, then BFS with decay 1 into
+    /// every non-opaque cell. Unloaded chunks act as opaque barriers so no
+    /// phantom light leaks through seams; stale light beyond the region is
+    /// bounded by the 15-block decay reach and refreshes as neighbor
+    /// regions relight. O(9 chunks), run per edit/load.
+    pub fn relight_region(&mut self, ccx: i32, ccz: i32) {
+        const RW: usize = 3 * CW; // 48
+        const RH: usize = CH;
+        // region-local idx: (lx * RW + lz) * RH + ly
+        let ridx = |lx: usize, lz: usize, ly: usize| (lx * RW + lz) * RH + ly;
+        let ox = (ccx - 1) * CW as i32;
+        let oz = (ccz - 1) * CW as i32;
+        // owned region copies: block read + light write without map hops
+        let mut blocks = vec![0u8; RW * RW * RH];
+        let mut light = vec![0u8; RW * RW * RH];
+        let mut loaded = [[false; 3]; 3];
+        for ix in 0..3usize {
+            for iz in 0..3usize {
+                let key = (ccx - 1 + ix as i32, ccz - 1 + iz as i32);
+                let Some(c) = self.chunks.get(&key) else { continue };
+                loaded[ix][iz] = true;
+                for lx in 0..CW {
+                    for lz in 0..CW {
+                        let rx = ix * CW + lx;
+                        let rz = iz * CW + lz;
+                        for ly in 0..CH {
+                            blocks[ridx(rx, rz, ly)] = c.data.blocks[idx(lx, lz, ly)];
+                        }
+                    }
+                }
+            }
+        }
+        let is_loaded = |rx: usize, rz: usize| loaded[rx / CW][rz / CW];
+
+        let mut queue: std::collections::VecDeque<u32> = std::collections::VecDeque::new();
+        let push = |q: &mut std::collections::VecDeque<u32>, rx: usize, rz: usize, ly: usize| {
+            q.push_back((rx as u32) | ((rz as u32) << 6) | ((ly as u32) << 12));
         };
-        // Above surface = full sky; below = attenuation by depth, floor 0.42.
-        let depth = h.saturating_sub(y as usize) as f32;
-        (1.0 - 0.035 * depth).clamp(0.42, 1.0)
+        // vertical seed; unloaded columns are solid barriers (light 0)
+        for rx in 0..RW {
+            for rz in 0..RW {
+                let mut lit = if is_loaded(rx, rz) { 15u8 } else { 0 };
+                for ly in (0..RH).rev() {
+                    let i = ridx(rx, rz, ly);
+                    if block::opaque(blocks[i]) {
+                        lit = 0;
+                    }
+                    light[i] = lit;
+                    if lit > 1 {
+                        push(&mut queue, rx, rz, ly);
+                    }
+                }
+            }
+        }
+        // boundary seeds: loaded world chunks hugging the region walls shine in
+        {
+            let mut seed_b = |rx: usize, rz: usize, wx: i32, wz: i32| {
+                if !is_loaded(rx, rz) {
+                    return;
+                }
+                let (ocx, ocz) = chunk_of(wx, wz);
+                if !self.chunks.contains_key(&(ocx, ocz)) {
+                    return;
+                }
+                for ly in 0..RH {
+                    let src = self.light_of(wx, ly as i32, wz);
+                    let i = ridx(rx, rz, ly);
+                    if src > 1 && src - 1 > light[i] && !block::opaque(blocks[i]) {
+                        light[i] = src - 1;
+                        push(&mut queue, rx, rz, ly);
+                    }
+                }
+            };
+            for rz in 0..RW {
+                seed_b(0, rz, ox - 1, oz + rz as i32);
+                seed_b(RW - 1, rz, ox + RW as i32, oz + rz as i32);
+            }
+            for rx in 0..RW {
+                seed_b(rx, 0, ox + rx as i32, oz - 1);
+                seed_b(rx, RW - 1, ox + rx as i32, oz + RW as i32);
+            }
+        }
+        // BFS relax: want = light-1 spreads into non-opaque in-region cells
+        const NB: [(i32, i32, i32); 6] =
+            [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)];
+        while let Some(p) = queue.pop_front() {
+            let (rx, rz, ry) = ((p & 63) as i32, ((p >> 6) & 63) as i32, (p >> 12) as i32);
+            let l = light[ridx(rx as usize, rz as usize, ry as usize)];
+            let want = l - 1;
+            for (dx, dy, dz) in NB {
+                let (nx, nz, ny) = (rx + dx, rz + dz, ry + dy);
+                if nx < 0 || nz < 0 || ny < 0 {
+                    continue;
+                }
+                let (nx, nz, ny) = (nx as usize, nz as usize, ny as usize);
+                if nx >= RW || nz >= RW || ny >= RH || !is_loaded(nx, nz) {
+                    continue;
+                }
+                let i = ridx(nx, nz, ny);
+                if want > light[i] && !block::opaque(blocks[i]) {
+                    light[i] = want;
+                    if want > 1 {
+                        push(&mut queue, nx, nz, ny);
+                    }
+                }
+            }
+        }
+        // write back + dirty meshes that sample this region (region + ring)
+        for ix in 0..3usize {
+            for iz in 0..3usize {
+                if !loaded[ix][iz] {
+                    continue;
+                }
+                let key = (ccx - 1 + ix as i32, ccz - 1 + iz as i32);
+                if let Some(c) = self.chunks.get_mut(&key) {
+                    for lx in 0..CW {
+                        for lz in 0..CW {
+                            let rx = ix * CW + lx;
+                            let rz = iz * CW + lz;
+                            for ly in 0..CH {
+                                c.data.light[idx(lx, lz, ly)] = light[ridx(rx, rz, ly)];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for ix in -1..=3i32 {
+            for iz in -1..=3i32 {
+                if let Some(c) = self.chunks.get_mut(&(ccx - 2 + ix, ccz - 2 + iz)) {
+                    c.mesh_dirty = true;
+                }
+            }
+        }
     }
 
     pub fn set(&mut self, x: i32, y: i32, z: i32, b: u8) {
@@ -206,8 +364,8 @@ impl World {
         let ly = y as usize;
         if let Some(c) = self.chunks.get_mut(&(cx, cz)) {
             c.data.blocks[idx(lx, lz, ly)] = b;
-            c.data.recalc_column(lx, lz);
             c.mesh_dirty = true;
+            self.queue_relight(cx, cz);
             // Border edits dirty the neighbor chunks whose faces face this block.
             let nb: [(i32, i32); 4] = [(cx - 1, cz), (cx + 1, cz), (cx, cz - 1), (cx, cz + 1)];
             let edge = (lx == 0, lx == CW - 1, lz == 0, lz == CW - 1);
@@ -228,6 +386,87 @@ impl World {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flat_world_chunk(fill: u8) -> crate::world::Chunk {
+        let mut d = ChunkData::new();
+        if fill != 0 {
+            for b in d.blocks.iter_mut() {
+                *b = fill;
+            }
+        }
+        Chunk { data: d, meshed: true, mesh_dirty: false }
+    }
+
+    #[test]
+    fn sky_fills_air_zeroes_opaque() {
+        let mut w = World::new(2);
+        let mut c = flat_world_chunk(0);
+        for y in 0..10 {
+            for x in 0..CW {
+                for z in 0..CW {
+                    c.data.blocks[idx(x, z, y)] = block::STONE;
+                }
+            }
+        }
+        w.chunks.insert((0, 0), c);
+        w.relight_region(0, 0);
+        let c = &w.chunks[&(0, 0)];
+        assert_eq!(c.data.light[idx(4, 4, 10)], 15, "air above surface full sky");
+        assert_eq!(c.data.light[idx(4, 4, 5)], 0, "interior stone unlit");
+    }
+
+    #[test]
+    fn shaft_floods_cave_with_decay() {
+        let mut w = World::new(2);
+        let mut c = flat_world_chunk(block::STONE);
+        // shaft down to y=64 at (8,8), cave corridor along -x at y=64
+        for y in 64..CH {
+            c.data.blocks[idx(8, 8, y)] = block::AIR;
+        }
+        for x in 0..8 {
+            c.data.blocks[idx(x, 8, 64)] = block::AIR;
+        }
+        w.chunks.insert((0, 0), c);
+        w.relight_region(0, 0);
+        let c = &w.chunks[&(0, 0)];
+        assert_eq!(c.data.light[idx(8, 8, 64)], 15, "shaft mouth full");
+        assert_eq!(c.data.light[idx(7, 8, 64)], 14, "first cave cell decays 1");
+        assert_eq!(c.data.light[idx(0, 8, 64)], 7, "8 blocks in: 15-8");
+        // solid stone never carries light
+        assert_eq!(c.data.light[idx(4, 4, 40)], 0, "stone interior unlit");
+    }
+
+    #[test]
+    fn unloaded_neighbor_is_a_light_barrier() {
+        // sealed 5x5x5 room, no sky path: must stay dark while the
+        // neighbor chunk is unloaded (no phantom 15 leaking through seams)
+        let mut w = World::new(2);
+        let mut c = flat_world_chunk(block::STONE);
+        for x in 4..9 {
+            for z in 4..9 {
+                for y in 40..45 {
+                    c.data.blocks[idx(x, z, y)] = block::AIR;
+                }
+            }
+        }
+        w.chunks.insert((0, 0), c);
+        w.relight_region(0, 0);
+        assert_eq!(w.chunks[&(0, 0)].data.light[idx(6, 6, 42)], 0, "sealed room dark");
+        // load an open-sky neighbor at +x and carve a tunnel from its edge
+        // into the room: boundary seed + BFS must shine in with decay 1
+        let n = flat_world_chunk(0); // all air = fully lit columns
+        w.chunks.insert((1, 0), n);
+        if let Some(c0) = w.chunks.get_mut(&(0, 0)) {
+            for x in 9..16 {
+                c0.data.blocks[idx(x, 6, 42)] = block::AIR;
+            }
+        }
+        w.relight_region(0, 0);
+        // world x=16 (chunk 1, open column) is 15; tunnel x=15 -> 14, ...
+        assert_eq!(w.chunks[&(0, 0)].data.light[idx(15, 6, 42)], 14, "tunnel mouth");
+        assert_eq!(w.chunks[&(0, 0)].data.light[idx(8, 6, 42)], 7, "room entry, 8 in");
+        assert_eq!(w.chunks[&(0, 0)].data.light[idx(6, 6, 42)], 5, "room center, 10 in");
+    }
 
     #[test]
     fn coord_roundtrip_negative() {

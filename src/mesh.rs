@@ -4,7 +4,7 @@
 // view-proj uniform: zero per-chunk CPU cost beyond the draw call itself.
 // Two vertex streams: opaque and water (separate pipelines/pass).
 
-use crate::world::{block, ChunkData, World, CW, CH};
+use crate::world::{block, idx, ChunkData, World, CW, CH, WATER_Y};
 use bytemuck::{Pod, Zeroable};
 
 #[repr(C)]
@@ -25,19 +25,28 @@ pub struct Face {
     pub light: f32,
 }
 
+// Face tables: n = normal, c = 4 corners, ab = tile UV corner per vertex.
+// Winding law (mesh.rs:505, verified empirically on this stack): faces seen
+// by the camera need POSITIVE NDC shoelace = CCW from outside. Each face's
+// shoelace here: (c1-c0)x(c2-c1) = +n. Cross-checked 2026-11-10: the old
+// table had -Y/+Y corners CW (culled: tops invisible) and side UV axes
+// mixed (a varying with y = 90-degree rotation; v=0 at world bottom = flip).
+// UV law: atlas row 0 = top (wgpu v origin); side faces carry v=0 at the
+// TOP world edge (y=1); u increases toward the viewer's right (right =
+// forward x up) so tiles are upright and never mirrored.
 pub const FACES: [Face; 6] = [
     // -Y
     Face { n: [0, -1, 0], c: [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]], ab: [[0, 0], [1, 0], [1, 1], [0, 1]], light: 0.55 },
     // +Y
-    Face { n: [0, 1, 0], c: [[0, 1, 0], [0, 1, 1], [1, 1, 1], [1, 1, 0]], ab: [[0, 0], [0, 1], [1, 1], [1, 0]], light: 1.00 },
+    Face { n: [0, 1, 0], c: [[0, 1, 1], [1, 1, 1], [1, 1, 0], [0, 1, 0]], ab: [[0, 1], [1, 1], [1, 0], [0, 0]], light: 1.00 },
     // -X
-    Face { n: [-1, 0, 0], c: [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]], ab: [[0, 0], [1, 0], [1, 1], [0, 1]], light: 0.82 },
+    Face { n: [-1, 0, 0], c: [[0, 0, 1], [0, 1, 1], [0, 1, 0], [0, 0, 0]], ab: [[1, 1], [1, 0], [0, 0], [0, 1]], light: 0.82 },
     // +X
-    Face { n: [1, 0, 0], c: [[1, 0, 0], [1, 1, 0], [1, 1, 1], [1, 0, 1]], ab: [[0, 0], [1, 0], [1, 1], [0, 1]], light: 0.82 },
+    Face { n: [1, 0, 0], c: [[1, 0, 0], [1, 1, 0], [1, 1, 1], [1, 0, 1]], ab: [[1, 1], [1, 0], [0, 0], [0, 1]], light: 0.82 },
     // -Z
-    Face { n: [0, 0, -1], c: [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]], ab: [[0, 0], [1, 0], [1, 1], [0, 1]], light: 0.70 },
+    Face { n: [0, 0, -1], c: [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]], ab: [[1, 1], [1, 0], [0, 0], [0, 1]], light: 0.70 },
     // +Z
-    Face { n: [0, 0, 1], c: [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]], ab: [[0, 0], [1, 0], [1, 1], [0, 1]], light: 0.70 },
+    Face { n: [0, 0, 1], c: [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]], ab: [[0, 1], [1, 1], [1, 0], [0, 0]], light: 0.70 },
 ];
 
 /// AO brightness by level 0..3 (occluded..open).
@@ -183,43 +192,64 @@ fn pad_i(px: usize, pz: usize, py: usize) -> usize {
 
 pub struct Padded {
     pub v: Vec<u8>,
-    pub heights: [u8; PW * PW],
+    pub light: Vec<u8>,
 }
 
-/// Copy chunk + 2-cell world border into a contiguous padded volume.
+/// Copy chunk + 2-cell world border into contiguous padded block and light
+/// volumes. The border spans at most the 8 neighbor chunks, so all 3x3
+/// chunk pointers are resolved once (9 probes) and every cell reads a raw
+/// array: zero hashmap traffic in the fill loop.
 pub fn pad_chunk(world: &World, cx: i32, cz: i32, data: &ChunkData) -> Padded {
     let ox = cx * CW as i32;
     let oz = cz * CW as i32;
     let mut v = vec![0u8; PW * PW * PH];
-    let mut heights = [0u8; PW * PW];
-    for px in 0..PW {
-        for pz in 0..PW {
-            let wx = ox + px as i32 - 2;
-            let wz = oz + pz as i32 - 2;
-            let interior = px >= 2 && px < 2 + CW && pz >= 2 && pz < 2 + CW;
-            let mut h = 0u8;
-            for py in 0..PH {
-                let y = py as i32 - 2;
-                let b = if interior && y >= 0 && y < CH as i32 {
-                    data.get(px - 2, pz - 2, y as usize)
-                } else {
-                    world.get(wx, y, wz)
-                };
-                v[pad_i(px, pz, py)] = b;
-                h = if b != 0 { (py).min(255) as u8 } else { h };
+    let mut light = vec![0u8; PW * PW * PH];
+    let mut nb: [Option<&ChunkData>; 9] = [None; 9];
+    nb[4] = Some(data);
+    for dx in -1..=1i32 {
+        for dz in -1..=1i32 {
+            if dx == 0 && dz == 0 {
+                continue;
             }
-            heights[px * PW + pz] = h;
+            nb[((dx + 1) * 3 + (dz + 1)) as usize] =
+                world.chunks.get(&(cx + dx, cz + dz)).map(|c| &c.data);
         }
     }
-    Padded { v, heights }
+    for px in 0..PW {
+        // world x of this pad column; pad spans ox-2 .. ox+CW+1
+        let wx = ox + px as i32 - 2;
+        let dx = wx.div_euclid(CW as i32) - cx;
+        for pz in 0..PW {
+            let wz = oz + pz as i32 - 2;
+            let dz = wz.div_euclid(CW as i32) - cz;
+            let src = nb[((dx + 1) * 3 + (dz + 1)) as usize];
+            // local coords within the owning chunk (div_euclid exact here)
+            let (mlx, mlz) = (wx.rem_euclid(CW as i32) as usize, wz.rem_euclid(CW as i32) as usize);
+            for py in 0..PH {
+                let y = py as i32 - 2;
+                let i = pad_i(px, pz, py);
+                match src {
+                    Some(cd) if y >= 0 && y < CH as i32 => {
+                        let li = idx(mlx, mlz, y as usize);
+                        v[i] = cd.blocks[li];
+                        light[i] = cd.light[li];
+                    }
+                    _ => {
+                        // unloaded / out-of-height: matches World::get fallback
+                        v[i] = if y >= WATER_Y as i32 && y < CH as i32 { block::STONE } else { 0 };
+                        light[i] = 15;
+                    }
+                }
+            }
+        }
+    }
+    Padded { v, light }
 }
 
-/// Sky brightness from padded column height at (px,pz) for cell row py.
+/// Sky brightness 0..1 at a padded cell (flood-filled light / 15).
 #[inline(always)]
 fn sky_at(pad: &Padded, px: usize, pz: usize, py: usize) -> f32 {
-    let h = pad.heights[px * PW + pz] as i32;
-    let depth = (h - py as i32).max(0) as f32;
-    (1.0 - 0.035 * depth).clamp(0.42, 1.0)
+    pad.light[pad_i(px, pz, py)] as f32 * (1.0 / 15.0)
 }
 
 /// Mesh one chunk. Appends opaque + water vertices. Assumes 4 horizontal
@@ -262,41 +292,36 @@ pub fn mesh_chunk(
                     }
                     let tile = block::tile(b, fi);
                     let sky = sky_at(&pad, qx as usize, qz as usize, qy as usize);
-                    // per-corner AO in the neighbor plane
+                    // per-corner AO in the neighbor plane. Tangent axes and
+                    // per-corner signs come straight from c[] (sign = 2*corner-1
+                    // along each tangent axis), never from ab: UV orientation
+                    // can never desync the occlusion samples.
                     let mut ao = [0u8; 4];
-                    let mut any_ao = false;
                     if !isw {
-                        // side axes e1,e2 derived from the corner table
-                        let e1 = [
-                            f.c[1][0] - f.c[0][0],
-                            f.c[1][1] - f.c[0][1],
-                            f.c[1][2] - f.c[0][2],
-                        ];
-                        let e2 = [
-                            f.c[2][0] - f.c[1][0],
-                            f.c[2][1] - f.c[1][1],
-                            f.c[2][2] - f.c[1][2],
-                        ];
+                        let (t1, t2) = if f.n[1] != 0 {
+                            (0usize, 2usize)
+                        } else if f.n[0] != 0 {
+                            (1usize, 2usize)
+                        } else {
+                            (0usize, 1usize)
+                        };
                         for i in 0..4 {
-                            let (a, bb) = (f.ab[i][0] as i32 * 2 - 1, f.ab[i][1] as i32 * 2 - 1);
-                            let s1o = (qx as i32 + e1[0] * a, qz as i32 + e1[1] * a, qy as i32 + e1[2] * a);
-                            let s2o = (qx as i32 + e2[0] * bb, qz as i32 + e2[1] * bb, qy as i32 + e2[2] * bb);
-                            let coo = (
-                                s1o.0 + e2[0] * bb,
-                                s1o.1 + e2[1] * bb,
-                                s1o.2 + e2[2] * bb,
-                            );
-                            let s1 = u8::from(block::opaque(pad.v[pad_i(s1o.0 as usize, s1o.1 as usize, s1o.2 as usize)]));
-                            let s2 = u8::from(block::opaque(pad.v[pad_i(s2o.0 as usize, s2o.1 as usize, s2o.2 as usize)]));
-                            let c = u8::from(block::opaque(pad.v[pad_i(coo.0 as usize, coo.1 as usize, coo.2 as usize)]));
+                            let mut o1 = [0i32; 3];
+                            o1[t1] = f.c[i][t1] * 2 - 1;
+                            let mut o2 = [0i32; 3];
+                            o2[t2] = f.c[i][t2] * 2 - 1;
+                            // pad tuples are (x, z, y); offsets are [x, y, z]
+                            let s1p = (qx + o1[0], qz + o1[2], qy + o1[1]);
+                            let s2p = (qx + o2[0], qz + o2[2], qy + o2[1]);
+                            let cp = (qx + o1[0] + o2[0], qz + o1[2] + o2[2], qy + o1[1] + o2[1]);
+                            let s1 = u8::from(block::opaque(pad.v[pad_i(s1p.0 as usize, s1p.1 as usize, s1p.2 as usize)]));
+                            let s2 = u8::from(block::opaque(pad.v[pad_i(s2p.0 as usize, s2p.1 as usize, s2p.2 as usize)]));
+                            let c = u8::from(block::opaque(pad.v[pad_i(cp.0 as usize, cp.1 as usize, cp.2 as usize)]));
                             let m = s1 & s2;
                             let occ = s1 + s2 + c + (m & (1 - c)); // 0..3, branchless
-                            let lvl = 3 - occ;
-                            ao[i] = lvl;
-                            any_ao |= lvl < 3;
+                            ao[i] = 3 - occ;
                         }
                     }
-                    let _ = any_ao;
                     // quad flip to avoid AO diagonal seams
                     let flip = ((ao[0] + ao[2]) < (ao[1] + ao[3])) as usize;
                     let tri: [usize; 6] = if flip == 0 {
@@ -315,9 +340,9 @@ pub fn mesh_chunk(
                         let v = (ty + if bb == 1 { 15.5 } else { 0.5 }) / ATLAS_PX as f32;
                         dst.push(Vertex {
                             pos: [
-                                (ox + f.c[ci][0]) as f32,
+                                (ox + lx as i32 + f.c[ci][0]) as f32,
                                 (ly as i32 + f.c[ci][1]) as f32,
-                                (oz + f.c[ci][2]) as f32,
+                                (oz + lz as i32 + f.c[ci][2]) as f32,
                                 1.0,
                             ],
                             uv: [u, v],
@@ -367,29 +392,29 @@ pub fn mesh_chunk_plain(
                         continue;
                     }
                     let tile = block::tile(b, fi);
-                    let sky = world.sky_of_neighbor(wx + f.n[0], wy + f.n[1], wz + f.n[2]);
+                    let sky = world.light_of(wx + f.n[0], wy + f.n[1], wz + f.n[2]) as f32
+                        * (1.0 / 15.0);
                     let mut ao = [3u8; 4];
                     if !isw {
-                        let e1 = [
-                            f.c[1][0] - f.c[0][0],
-                            f.c[1][1] - f.c[0][1],
-                            f.c[1][2] - f.c[0][2],
-                        ];
-                        let e2 = [
-                            f.c[2][0] - f.c[1][0],
-                            f.c[2][1] - f.c[1][1],
-                            f.c[2][2] - f.c[1][2],
-                        ];
+                        let (t1, t2) = if f.n[1] != 0 {
+                            (0usize, 2usize)
+                        } else if f.n[0] != 0 {
+                            (1usize, 2usize)
+                        } else {
+                            (0usize, 1usize)
+                        };
+                        let q = (wx + f.n[0], wy + f.n[1], wz + f.n[2]);
                         for i in 0..4 {
-                            let a = f.ab[i][0] as i32 * 2 - 1;
-                            let bb = f.ab[i][1] as i32 * 2 - 1;
-                            let q = (wx + f.n[0], wy + f.n[1], wz + f.n[2]);
-                            let s1 = block::opaque(world.get(q.0 + e1[0] * a, q.1 + e1[1] * a, q.2 + e1[2] * a));
-                            let s2 = block::opaque(world.get(q.0 + e2[0] * bb, q.1 + e2[1] * bb, q.2 + e2[2] * bb));
+                            let mut o1 = [0i32; 3];
+                            o1[t1] = f.c[i][t1] * 2 - 1;
+                            let mut o2 = [0i32; 3];
+                            o2[t2] = f.c[i][t2] * 2 - 1;
+                            let s1 = block::opaque(world.get(q.0 + o1[0], q.1 + o1[1], q.2 + o1[2]));
+                            let s2 = block::opaque(world.get(q.0 + o2[0], q.1 + o2[1], q.2 + o2[2]));
                             let cc = block::opaque(world.get(
-                                q.0 + e1[0] * a + e2[0] * bb,
-                                q.1 + e1[1] * a + e2[1] * bb,
-                                q.2 + e1[2] * a + e2[2] * bb,
+                                q.0 + o1[0] + o2[0],
+                                q.1 + o1[1] + o2[1],
+                                q.2 + o1[2] + o2[2],
                             ));
                             ao[i] = if s1 && s2 {
                                 0
@@ -413,9 +438,9 @@ pub fn mesh_chunk_plain(
                         let lvl = if isw { 3 } else { ao[ci] as usize };
                         dst.push(Vertex {
                             pos: [
-                                (ox + f.c[ci][0]) as f32,
-                                (ly + f.c[ci][1]) as f32,
-                                (oz + f.c[ci][2]) as f32,
+                                (wx + f.c[ci][0]) as f32,
+                                (wy + f.c[ci][1]) as f32,
+                                (wz + f.c[ci][2]) as f32,
                                 1.0,
                             ],
                             uv: [
@@ -442,7 +467,6 @@ mod tests {
             w.chunks
                 .insert(c, Chunk { data: ChunkData::new(), meshed: false, mesh_dirty: false });
         }
-        d.recalc_column(0, 0);
         w.chunks.get_mut(&(0, 0)).unwrap().data = d;
         w
     }
@@ -550,6 +574,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Winding law, table-level: shoelace of first three corners equals the
+    /// face normal, i.e. CCW seen from outside = camera-facing under the
+    /// positive-NDC-area law (front ends, not just one camera pose).
+    #[test]
+    fn every_face_shoelace_equals_normal() {
+        for f in FACES.iter() {
+            let e1 = [
+                f.c[1][0] - f.c[0][0],
+                f.c[1][1] - f.c[0][1],
+                f.c[1][2] - f.c[0][2],
+            ];
+            let e2 = [
+                f.c[2][0] - f.c[1][0],
+                f.c[2][1] - f.c[1][1],
+                f.c[2][2] - f.c[1][2],
+            ];
+            let cr = [
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0],
+            ];
+            assert_eq!(cr, f.n, "shoelace != normal for {:?}", f.n);
+        }
+    }
+
+    /// UV law: side faces carry v=0 (atlas tile top row) at the TOP world
+    /// edge and u along the viewer's right (right = up x backward = +Z/-Z/+X/-X
+    /// for -X/+X/-Z/+Z). Tiles (grass lip, snow cap, plank boards, bark
+    /// streaks) are vertically asymmetric: any rotation or mirror breaks them.
+    #[test]
+    fn side_face_uvs_are_upright_and_unmirrored() {
+        for f in FACES.iter() {
+            if f.n[1] != 0 {
+                continue; // top/bottom orientation is a free rotation
+            }
+            // viewer right axis with sign: -X -> +z, +X -> -z, -Z -> -x, +Z -> +x
+            let (axis, inv) = match f.n {
+                [-1, 0, 0] => (2usize, false),
+                [1, 0, 0] => (2usize, true),
+                [0, 0, -1] => (0usize, true),
+                [0, 0, 1] => (0usize, false),
+                _ => unreachable!(),
+            };
+            for i in 0..4 {
+                let want_a = f.c[i][axis] ^ u8::from(inv) as i32;
+                let want_b = f.c[i][1] ^ 1;
+                assert_eq!(
+                    (f.ab[i][0], f.ab[i][1]),
+                    (want_a as u8, want_b as u8),
+                    "face {:?} corner {:?}: uv {:?} not upright/unmirrored",
+                    f.n,
+                    f.c[i],
+                    f.ab[i]
+                );
+            }
+        }
+    }
+
+    /// End-to-end UV check through the real kernel: a grass block's +Z face
+    /// top vertices sample the green lip half of tile 1, bottom vertices the
+    /// dirt half. Catches kernel-level uv math errors the table test can't.
+    #[test]
+    fn grass_side_face_samples_lip_on_top_dirt_on_bottom() {
+        let mut d = ChunkData::new();
+        d.blocks[idx(4, 4, 40)] = block::GRASS;
+        let w = world_with(d);
+        let (mut op, mut wat) = (Vec::new(), Vec::new());
+        mesh_chunk(&w, 0, 0, &w.chunks[&(0, 0)].data, &mut op, &mut wat);
+        // grass_side = tile 1: column 1 row 0 -> u in [16,32)/64, v in [0,16)/64.
+        // Side-face verts at pos z == 5.0; exclude the +Y top face (tile 0,
+        // u in [0,16)/64) which shares those corner positions.
+        let side = |v: &Vertex| v.uv[0] > 16.0 / 64.0 && v.uv[0] < 32.0 / 64.0;
+        let top_v: Vec<f32> = op
+            .iter()
+            .filter(|v| (v.pos[2] - 5.0).abs() < 1e-6 && v.pos[1] > 40.5 && side(v))
+            .map(|v| v.uv[1])
+            .collect();
+        let bot_v: Vec<f32> = op
+            .iter()
+            .filter(|v| (v.pos[2] - 5.0).abs() < 1e-6 && v.pos[1] < 40.5 && side(v))
+            .map(|v| v.uv[1])
+            .collect();
+        assert!(!top_v.is_empty() && !bot_v.is_empty());
+        assert!(
+            top_v.iter().all(|v| (v - 0.5 / 64.0).abs() < 1e-5),
+            "top verts v {top_v:?} != tile-top 0.5/64"
+        );
+        assert!(
+            bot_v.iter().all(|v| (v - 15.5 / 64.0).abs() < 1e-5),
+            "bottom verts v {bot_v:?} != tile-bottom 15.5/64"
+        );
     }
 }
 

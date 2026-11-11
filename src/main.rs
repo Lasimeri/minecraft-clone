@@ -109,11 +109,26 @@ impl Game {
                     (cx, cz),
                     world::Chunk { data, meshed: false, mesh_dirty: false },
                 );
+                w.queue_relight(cx, cz);
             }
             n += 1;
             if n >= 16 {
                 break; // spread insertion cost across frames
             }
+        }
+    }
+
+    /// Drain the relight queue: full region flood per entry, budgeted so a
+    /// load burst never stalls a frame (each region ~2-4 ms worst case).
+    fn relight_pass(&mut self) {
+        const BUDGET: usize = 3;
+        let Some(w) = &mut self.wld else { return };
+        let mut n = 0;
+        while n < BUDGET {
+            let Some(c) = w.relight_pending.pop_front() else { break };
+            w.relight_set.remove(&c);
+            w.relight_region(c.0, c.1);
+            n += 1;
         }
     }
 
@@ -124,7 +139,7 @@ impl Game {
         let mut todo: Vec<(i64, (i32, i32))> = w
             .chunks
             .iter()
-            .filter(|(c, ch)| (!ch.meshed || ch.mesh_dirty) && w.has_4_neighbors(c.0, c.1))
+            .filter(|(c, ch)| (!ch.meshed || ch.mesh_dirty) && w.has_4_neighbors(c.0, c.1) && !w.relight_set.contains(c))
             .map(|(c, _)| {
                 let dx = (c.0 - pcx) as i64;
                 let dz = (c.1 - pcz) as i64;
@@ -390,6 +405,7 @@ impl Game {
 
         self.poll_generated();
         self.request_chunks();
+        self.relight_pass();
         self.mesh_pass();
         self.unload_far();
         self.frames += 1;
@@ -572,6 +588,14 @@ fn shot_render(path: &str, seed: u32, window: std::sync::Arc<winit::window::Wind
         }
     }
     let mut meshes = ChunkGpuMap::new();
+    // flood sky light to convergence (two sweeps: boundary light flows in)
+    for _ in 0..2 {
+        for cx in -4..=4 {
+            for cz in -4..=4 {
+                wld.relight_region(cx, cz);
+            }
+        }
+    }
     let (mut o, mut wt) = (Vec::new(), Vec::new());
     for c in wld.chunks.keys().copied().collect::<Vec<_>>() {
         o.clear();
