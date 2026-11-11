@@ -278,8 +278,12 @@ pub fn mesh_chunk(
                 }
                 let isw = block::is_water(b);
                 for (fi, f) in FACES.iter().enumerate() {
+                    // Pad tuple is (x, z, y); the normal is [x, y, z]. n[1]
+                    // must feed the PAD Y slot and n[2] the PAD Z slot.
+                    // Swapped, this suppressed every top/bottom face whose
+                    // +Z neighbor was solid (root cause, fixed 2026-11-11).
                     let (qx, qz, qy) =
-                        (px as i32 + f.n[0], pz as i32 + f.n[1], py as i32 + f.n[2]);
+                        (px as i32 + f.n[0], pz as i32 + f.n[2], py as i32 + f.n[1]);
                     // padded volume always contains the neighbor cell (py in 0..PH)
                     let nb = pad.v[pad_i(qx as usize, qz as usize, qy as usize)];
                     let emit = if isw {

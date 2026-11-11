@@ -122,9 +122,10 @@ impl Generator {
                     };
                     d.blocks[idx(lx, lz, y)] = b;
                 }
-                // caves: carve 3D noise below surface, never through bedrock floor
+                // caves: carve 3D noise below a 4-block crust so the surface
+                // never breaches into shafts/sinkholes
                 if h > 5 {
-                    for y in 1..h.min(CH - 1) {
+                    for y in 1..(h.saturating_sub(4)).max(1).min(CH - 1) {
                         let c = self.cave.get([
                             wx as f64 * 0.055,
                             y as f64 * 0.09,

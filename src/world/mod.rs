@@ -356,10 +356,13 @@ impl World {
         }
     }
 
-    pub fn has_4_neighbors(&self, cx: i32, cz: i32) -> bool {
-        [(cx - 1, cz), (cx + 1, cz), (cx, cz - 1), (cx, cz + 1)]
-            .iter()
-            .all(|c| self.chunks.contains_key(c))
+    /// All 8 surrounding chunks loaded: the padded mesher samples diagonals
+    /// for AO, and unloaded columns fall back to solid stone above sea
+    /// level, so diagonal seams must wait for the corner chunks.
+    pub fn has_8_neighbors(&self, cx: i32, cz: i32) -> bool {
+        [-1i32, 0, 1].iter().all(|dx| [-1i32, 0, 1].iter().all(|dz| {
+            (*dx == 0 && *dz == 0) || self.chunks.contains_key(&(cx + dx, cz + dz))
+        }))
     }
 }
 

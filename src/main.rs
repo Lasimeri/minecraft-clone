@@ -19,7 +19,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-const MESH_BUDGET: usize = 3; // chunk remeshes per frame
+const MESH_BUDGET: usize = 8; // chunk remeshes per frame (~0.25 ms each)
 
 struct Game {
     window: Option<std::sync::Arc<Window>>,
@@ -120,6 +120,8 @@ impl Game {
 
     /// Drain the relight queue: full region flood per entry, budgeted so a
     /// load burst never stalls a frame (each region ~2-4 ms worst case).
+    /// Light is a vertex attribute, so every already-meshed chunk whose
+    /// light plane the flood rewrote must be re-meshed.
     fn relight_pass(&mut self) {
         const BUDGET: usize = 3;
         let Some(w) = &mut self.wld else { return };
@@ -128,6 +130,15 @@ impl Game {
             let Some(c) = w.relight_pending.pop_front() else { break };
             w.relight_set.remove(&c);
             w.relight_region(c.0, c.1);
+            for dx in -1..=1i32 {
+                for dz in -1..=1i32 {
+                    if let Some(ch) = w.chunks.get_mut(&(c.0 + dx, c.1 + dz)) {
+                        if ch.meshed {
+                            ch.mesh_dirty = true;
+                        }
+                    }
+                }
+            }
             n += 1;
         }
     }
@@ -139,7 +150,7 @@ impl Game {
         let mut todo: Vec<(i64, (i32, i32))> = w
             .chunks
             .iter()
-            .filter(|(c, ch)| (!ch.meshed || ch.mesh_dirty) && w.has_4_neighbors(c.0, c.1) && !w.relight_set.contains(c))
+            .filter(|(c, ch)| (!ch.meshed || ch.mesh_dirty) && w.has_8_neighbors(c.0, c.1) && !w.relight_set.contains(c))
             .map(|(c, _)| {
                 let dx = (c.0 - pcx) as i64;
                 let dz = (c.1 - pcz) as i64;
@@ -514,8 +525,16 @@ fn main() {
                 }
                 i += 2;
             }
+            "--xsec" => {
+                let (x, z): (i32, i32) = (
+                    args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(8),
+                    args.get(i + 2).and_then(|s| s.parse().ok()).unwrap_or(8),
+                );
+                xsec_dump(seed, x, z);
+                return;
+            }
             _ => {
-                eprintln!("usage: minecraft-clone [--seed N] [--radius R] [--bench-mesh N] [--stats]");
+                eprintln!("usage: minecraft-clone [--seed N] [--radius R] [--bench-mesh N] [--stats] [--xsec X Z]");
                 std::process::exit(2);
             }
         }
@@ -570,6 +589,137 @@ fn shot(path: &str, seed: u32) {
     let event_loop: EventLoop<()> = EventLoop::new().unwrap();
     let mut app = ShotApp { path: path.to_string(), seed, done: false };
     event_loop.run_app(&mut app).expect("shot event loop");
+}
+
+/// Debug: print a vertical column cross-section + porosity + face audit for
+/// the chunk containing (x,z), from the same generator the game uses.
+fn xsec_dump(seed: u32, x: i32, z: i32) {
+    let g = world::terrain::Generator::new(seed);
+    let mut wld = world::World::new(2);
+    for cx in -2..=2 {
+        for cz in -2..=2 {
+            wld.chunks.insert(
+                (cx, cz),
+                world::Chunk { data: g.generate(cx, cz), meshed: false, mesh_dirty: false },
+            );
+        }
+    }
+    let sym = |b: u8| match b {
+        0 => '.',
+        1 => 'G',
+        2 => 'd',
+        3 => '#',
+        4 => 'c',
+        5 => 's',
+        6 => '~',
+        7 => '|',
+        8 => '*',
+        9 => 'o',
+        10 => 'S',
+        11 => 'p',
+        12 => 'B',
+        13 => 'g',
+        _ => '?',
+    };
+    // column at (x,z), y 0..70
+    for y in (0..70).rev() {
+        let b = wld.get(x, y, z);
+        print!("{}", sym(b));
+    }
+    println!("  <- column x={x} z={z} y69..0");
+    // porosity: air fraction below surface in the center chunk
+    let (ccx, ccz) = (x.div_euclid(16), z.div_euclid(16));
+    let cd = &wld.chunks[&(ccx, ccz)].data;
+    let mut air_below = 0usize;
+    let mut solid_below = 0usize;
+    let mut surf_sum = 0usize;
+    for lx in 0..world::CW {
+        for lz in 0..world::CW {
+            let col = &cd.blocks[(lx * world::CW + lz) * world::CH..(lx * world::CW + lz) * world::CH + world::CH];
+            let top = col.iter().rposition(|b| *b != 0 && *b != 6).unwrap_or(0);
+            surf_sum += top;
+            for y in 0..top {
+                if col[y] == 0 {
+                    air_below += 1;
+                } else {
+                    solid_below += 1;
+                }
+            }
+        }
+    }
+    println!(
+        "chunk ({ccx},{ccz}): mean_surface_y {} air_below {air_below} solid_below {solid_below} porosity {:.3}",
+        surf_sum / (world::CW * world::CW),
+        air_below as f64 / (air_below + solid_below) as f64
+    );
+    // surface breaches: columns where air sits within 3 of the terrain top
+    let mut breach = 0usize;
+    for lx in 0..world::CW {
+        for lz in 0..world::CW {
+            let col = &cd.blocks[(lx * world::CW + lz) * world::CH..(lx * world::CW + lz) * world::CH + world::CH];
+            let top = col.iter().rposition(|b| *b != 0 && *b != 6).unwrap_or(0);
+            if (1..=3).any(|d| top > d && col[top - d] == 0) {
+                breach += 1;
+            }
+        }
+    }
+    println!("breach_columns {breach}/256");
+    // face audit: recount expected faces from blocks vs emitted vertices
+    let (mut o, mut wt) = (Vec::new(), Vec::new());
+    mesh::mesh_chunk(&wld, ccx, ccz, cd, &mut o, &mut wt);
+    let mut exp = 0usize;
+    for lx in 0..world::CW {
+        for lz in 0..world::CW {
+            for ly in 0..world::CH {
+                let b = cd.get(lx, lz, ly);
+                if b == 0 {
+                    continue;
+                }
+                for (dx, dz, dy) in [(-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)] {
+                    let nb = wld.get(
+                        ccx * 16 + lx as i32 + dx,
+                        ly as i32 + dy,
+                        ccz * 16 + lz as i32 + dz,
+                    );
+                    let e = if b == 6 { nb != 6 && !world::block::opaque(nb) } else { !world::block::opaque(nb) };
+                    exp += usize::from(e);
+                }
+            }
+        }
+    }
+    println!(
+        "emitted opaque_faces {} water_faces {} expected(non-water) {}",
+        o.len() / 6,
+        wt.len() / 6,
+        exp
+    );
+    // per-direction area histogram from emitted vertex winding
+    let mut dirs = [0u32; 6];
+    for tri in o.chunks_exact(3) {
+        let (a, b, c) = (&tri[0].pos, &tri[1].pos, &tri[2].pos);
+        let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let n = [
+            e1[1] * e2[2] - e1[2] * e2[1],
+            e1[2] * e2[0] - e1[0] * e2[2],
+            e1[0] * e2[1] - e1[1] * e2[0],
+        ];
+        let k = if n[0] > 0.0 {
+            1
+        } else if n[0] < 0.0 {
+            0
+        } else if n[1] > 0.0 {
+            3
+        } else if n[1] < 0.0 {
+            2
+        } else if n[2] > 0.0 {
+            5
+        } else {
+            4
+        };
+        dirs[k] += 1;
+    }
+    println!("opaque tri dirs -X,+X,-Y,+Y,-Z,+Z: {dirs:?}");
 }
 
 fn shot_render(path: &str, seed: u32, window: std::sync::Arc<winit::window::Window>) {

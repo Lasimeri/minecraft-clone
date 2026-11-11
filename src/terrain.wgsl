@@ -36,9 +36,16 @@ fn vs(v: VSIn) -> VSOut {
 
 @fragment
 fn fs(f: VSOut) -> @location(0) vec4<f32> {
+    // debug modes via uni.sky.w: 1=flat unlit (no texture gate), 2=light.x,
+    // 3=light.y; fog off. Placed BEFORE the atlas sample: mode 1 proves
+    // geometry presence independent of texture bytes.
+    if (uni.sky.w == 1.0) { return vec4<f32>(0.75, 0.15, 0.15, 1.0); }
+    if (uni.sky.w == 2.0) { return vec4<f32>(f.light.x, 0.0, 0.0, 1.0); }
+    if (uni.sky.w == 3.0) { return vec4<f32>(f.light.y, f.light.y, f.light.y, 1.0); }
     let c = textureSample(atlas, atlas_samp, f.uv);
     if (c.a < 0.05) { discard; }
-    var rgb = c.rgb * f.light.x * f.light.y;
+    // ambient floor 0.16: unlit caves/overhangs read as dark rock, not void
+    var rgb = c.rgb * f.light.x * max(f.light.y, 0.16);
     // cheap hemispheric ambient: downward faces get a touch of sky bounce
     let d = distance(f.world, uni.cam_pos.xyz);
     let fog_t = clamp((d - uni.fog.x) / max(uni.fog.y - uni.fog.x, 1.0), 0.0, 1.0);

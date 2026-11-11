@@ -40,6 +40,17 @@ struct Uni {
 
 pub const SKY: Vec3 = Vec3::new(0.53, 0.71, 0.94);
 
+/// Shader debug selector from MC_DEBUG_SHADER: 1=flat unlit, 2=light.x,
+/// 3=light.y. 0 = normal shading. Read per frame; costs one env lookup.
+fn dbg_mode() -> f32 {
+    match std::env::var("MC_DEBUG_SHADER").as_deref() {
+        Ok("1") => 1.0,
+        Ok("2") => 2.0,
+        Ok("3") => 3.0,
+        _ => 0.0,
+    }
+}
+
 impl Gpu {
     pub fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
@@ -220,7 +231,7 @@ impl Gpu {
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: if std::env::var("MC_NOCULL").is_ok() { None } else { Some(wgpu::Face::Back) },
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -362,8 +373,8 @@ impl Gpu {
         let uni = Uni {
             view_proj: vp.to_cols_array_2d(),
             cam_pos: [eye.x, eye.y, eye.z, 1.0],
-            fog: [fd * 0.62, fd * 0.97, 0.0, 0.0],
-            sky: [SKY.x, SKY.y, SKY.z, 0.0],
+            fog: [fd * 0.85, fd, 0.0, 0.0],
+            sky: [SKY.x, SKY.y, SKY.z, dbg_mode()],
         };
         self.queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uni));
 
@@ -464,7 +475,10 @@ impl Gpu {
     }
 
     fn view_proj(&self, eye: Vec3, dir: Vec3) -> Mat4 {
-        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
+        self.view_proj_ar(eye, dir, self.config.width as f32 / self.config.height.max(1) as f32)
+    }
+
+    fn view_proj_ar(&self, eye: Vec3, dir: Vec3, aspect: f32) -> Mat4 {
         let proj = Mat4::perspective_rh(std::f32::consts::FRAC_PI_2 * 0.78, aspect, 0.08, 1200.0);
         proj * Mat4::look_to_rh(eye, dir, Vec3::Y)
     }
@@ -490,16 +504,30 @@ impl Gpu {
             });
         }
         let half = Vec3::new(CW as f32 / 2.0, CH as f32 / 2.0, CW as f32 / 2.0);
+        let (mut drawn, mut culled) = (0usize, 0usize);
         for i in order {
             let m = &map[i];
             if m.count == 0 {
                 continue;
             }
             if !frustum.aabb_overlap(m.center(), half) {
+                culled += 1;
                 continue;
             }
+            drawn += 1;
             pass.set_vertex_buffer(0, m.buf.slice(..));
             pass.draw(0..m.count * 6, 0..1);
+        }
+        if std::env::var("MC_DEBUG_DRAW").is_ok() {
+            eprintln!(
+                "draw_stream water={water} drawn {drawn} culled {culled} culling=[{}]",
+                frustum
+                    .planes
+                    .iter()
+                    .map(|p| format!("({:.2},{:.2},{:.2},{:.2})", p[0], p[1], p[2], p[3]))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
         }
     }
 }
@@ -507,7 +535,7 @@ impl Gpu {
 /// Gribb-Hartmann frustum planes from a view-projection matrix.
 /// Planes point inward; a point is inside when dot >= 0 for all six.
 pub struct Frustum {
-    planes: [[f32; 4]; 6],
+    pub(crate) planes: [[f32; 4]; 6],
 }
 
 impl Frustum {
@@ -582,13 +610,13 @@ impl Gpu {
             mapped_at_creation: false,
         });
 
-        let vp = self.view_proj(eye, dir);
+        let vp = self.view_proj_ar(eye, dir, w as f32 / h.max(1) as f32);
         let fd = world.radius as f32 * CW as f32;
         let uni = Uni {
             view_proj: vp.to_cols_array_2d(),
             cam_pos: [eye.x, eye.y, eye.z, 1.0],
-            fog: [fd * 0.62, fd * 0.97, 0.0, 0.0],
-            sky: [SKY.x, SKY.y, SKY.z, 0.0],
+            fog: [fd * 0.85, fd, 0.0, 0.0],
+            sky: [SKY.x, SKY.y, SKY.z, dbg_mode()],
         };
         self.queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uni));
 
