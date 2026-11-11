@@ -179,26 +179,6 @@ impl World {
         }
     }
 
-    /// Block + sky light in one hashmap probe (pad construction hot path).
-    #[inline]
-    pub fn get_light(&self, x: i32, y: i32, z: i32) -> (u8, u8) {
-        if y < 0 || y >= CH as i32 {
-            return (0, 15);
-        }
-        let (cx, cz) = chunk_of(x, z);
-        match self.chunks.get(&(cx, cz)) {
-            Some(c) => {
-                let (lx, lz) = local_of(x, z);
-                let i = idx(lx, lz, y as usize);
-                (c.data.blocks[i], c.data.light[i])
-            }
-            None => {
-                let b = if y < WATER_Y { 0 } else { block::STONE };
-                (b, 15)
-            }
-        }
-    }
-
     /// Sky light 0..15 at a world cell. Unloaded columns read as open sky
     /// (matches the stone fallback in `get`: the surface is lit, and mesh
     /// seams redraw once the chunk arrives and relights).
