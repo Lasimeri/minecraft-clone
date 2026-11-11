@@ -14,7 +14,7 @@ use player::{Input, Player};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
@@ -296,23 +296,15 @@ impl ApplicationHandler for Game {
                     g.resize(s.width, s.height);
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                if self.locked {
-                    let Some(w) = &self.window else { return };
-                    let center = w.inner_size();
-                    let dx = position.x as f32 - center.width as f32 / 2.0;
-                    let dy = position.y as f32 - center.height as f32 / 2.0;
-                    if dx != 0.0 || dy != 0.0 {
-                        self.player.yaw -= dx * 0.0022;
-                        self.player.pitch -= dy * 0.0022;
-                        self.player.pitch = self.player.pitch.clamp(-1.5533, 1.5533);
-                        let _ = w.set_cursor_position(winit::dpi::PhysicalPosition::new(
-                            center.width as f64 / 2.0,
-                            center.height as f64 / 2.0,
-                        ));
+            WindowEvent::CursorMoved { .. } => {
+                // Look rotation comes from DeviceEvent::MouseMotion (raw
+                // relative deltas via zwp_relative_pointer); CursorMoved
+                // carries absolute surface coords that are meaningless
+                // under a locked pointer. Forward to egui only.
+                if !self.locked {
+                    if let Some(g) = &mut self.gpu {
+                        let _ = g.egui_state.on_window_event(&self.window.clone().unwrap(), &event);
                     }
-                } else if let Some(g) = &mut self.gpu {
-                    let _ = g.egui_state.on_window_event(&self.window.clone().unwrap(), &event);
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
@@ -370,6 +362,24 @@ impl ApplicationHandler for Game {
                     }
                 }
             }
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        // Raw unaccelerated deltas from zwp_relative_pointer; only arrive
+        // while the pointer is grabbed, but gate on locked regardless.
+        if !self.locked {
+            return;
+        }
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            self.player.yaw -= dx as f32 * 0.0022;
+            self.player.pitch -= dy as f32 * 0.0022;
+            self.player.pitch = self.player.pitch.clamp(-1.5533, 1.5533);
         }
     }
 
